@@ -203,8 +203,23 @@ export class AgentRuntime extends EventEmitter {
 
       if (!toolCall) {
         const clean = extractDoneSummary(fullResponse)
-        this.emit('done', { response: clean, tokenCount: accumulatedTokens || undefined })
-        return
+        if (clean) {
+          this.emit('done', { response: clean, tokenCount: accumulatedTokens || undefined })
+          return
+        }
+        // Recovery path: if the model produced neither a valid tool call nor a final
+        // answer, keep the loop alive and ask for a strict next response format.
+        messages.push({
+          role: 'user',
+          content: [
+            'Your previous response could not be executed.',
+            'Return EXACTLY one valid JSON tool call object with "tool" and "arguments",',
+            'or finish with a clear final response using "DONE: <summary>".',
+            'Do not return ambiguous text.',
+          ].join(' '),
+        })
+        this.emit('token', '\n[Retrying: model response had no valid tool call or DONE summary]\n')
+        continue
       }
 
       // Read-only tools: skip confirmation entirely — they have no side effects
