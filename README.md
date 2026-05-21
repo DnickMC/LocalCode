@@ -178,7 +178,9 @@ The agent reads entire files. For large files it shows the total line count and 
 
 ## Conversation history & context
 
-The last 20 turns (40 messages) are kept in context and sent to the model each iteration. Use `/compact` to summarize and free up context when working on long tasks.
+The agent keeps the current conversation in memory and sends it back to the model each iteration.  
+When the context gets long, older parts are automatically compacted into a short summary while recent turns stay verbatim.  
+Use `/compact` anytime to force a manual summary/compression.
 
 ---
 

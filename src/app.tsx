@@ -19,7 +19,14 @@ import { PtyManager } from "./pty/PtyManager";
 import { LLMRouter } from "./llm/LLMRouter";
 import { lspCheck } from "./lsp/LspRunner";
 import { LspManager } from "./lsp/LspManager";
-import { AgentMessage, ToolCall, ToolResult, Attachment } from "./shared/types";
+import {
+  AgentMessage,
+  ToolCall,
+  ToolResult,
+  Attachment,
+  Message,
+  LLMConfig,
+} from "./shared/types";
 import { BUILTIN_COMMANDS, COMMAND_SUGGESTIONS } from "./shared/constants";
 import { checkForUpdate, UpdateInfo } from "./shared/updateChecker";
 import { getAppVersion } from "./shared/version";
@@ -110,6 +117,8 @@ let _id = 0;
 const nextId = () => String(++_id);
 
 type AgentStatus = "idle" | "running" | "thinking" | "error";
+const MAX_CONTEXT_MESSAGES = 60;
+const CONTEXT_COMPACT_KEEP_RECENT = 40;
 interface ConfirmRequest {
   toolCall: ToolCall;
   reason: string;
@@ -233,6 +242,79 @@ function fmtTime(ts: number): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function buildContextFromMessages(messages: AgentMessage[]): Message[] {
+  const context: Message[] = [];
+  for (const m of messages) {
+    if (m.type === "text" && m.content.startsWith("> ")) {
+      context.push({ role: "user", content: m.content.slice(2) });
+      continue;
+    }
+    if (m.type === "done") {
+      const done = m.content.replace(/^DONE:\s*/i, "").trim();
+      if (done) context.push({ role: "assistant", content: done });
+      continue;
+    }
+    if (m.type === "tool_call" && m.toolCall) {
+      context.push({
+        role: "assistant",
+        content: JSON.stringify({
+          tool: m.toolCall.tool,
+          arguments: m.toolCall.arguments,
+        }),
+      });
+      continue;
+    }
+    if (m.type === "tool_result" && m.toolCall && m.toolResult) {
+      const toolOut = m.toolResult.success
+        ? (m.toolResult.output || "").slice(0, 3000)
+        : `error: ${m.toolResult.error || "unknown"}`;
+      context.push({
+        role: "user",
+        content: `Tool "${m.toolCall.tool}" result:\n${toolOut}`,
+      });
+    }
+  }
+  return context.slice(-MAX_CONTEXT_MESSAGES);
+}
+
+async function compactConversationContext(
+  history: Message[],
+  llmCfg: LLMConfig,
+): Promise<Message[]> {
+  if (history.length <= MAX_CONTEXT_MESSAGES) return history.slice(-MAX_CONTEXT_MESSAGES);
+  const older = history.slice(0, -CONTEXT_COMPACT_KEEP_RECENT);
+  const recent = history.slice(-CONTEXT_COMPACT_KEEP_RECENT);
+  if (older.length === 0) return history.slice(-MAX_CONTEXT_MESSAGES);
+
+  const transcript = older
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
+    .join("\n")
+    .slice(0, 14000);
+
+  try {
+    const result = await LLMRouter.stream(
+      [
+        {
+          role: "system",
+          content:
+            "Summarize this coding conversation as compact memory bullets with key goals, decisions, file changes, open constraints, and latest status. Keep it short and actionable.",
+        },
+        { role: "user", content: transcript },
+      ],
+      llmCfg,
+      () => {},
+    );
+    const compacted = (result.response || "").trim();
+    if (!compacted) return history.slice(-MAX_CONTEXT_MESSAGES);
+    return [
+      { role: "assistant", content: `[Conversation summary]\n${compacted}` },
+      ...recent,
+    ].slice(-MAX_CONTEXT_MESSAGES);
+  } catch {
+    return history.slice(-MAX_CONTEXT_MESSAGES);
+  }
 }
 
 // ── User message block ────────────────────────────────────────────────────────
@@ -724,9 +806,7 @@ export const App: React.FC<AppProps> = ({
   const [pluginCmds, setPluginCmds] = useState<
     Array<{ cmd: string; description: string }>
   >([]);
-  const [convHistory, setConvHistory] = useState<
-    import("./shared/types").Message[]
-  >([]);
+  const [convHistory, setConvHistory] = useState<Message[]>([]);
   const [infoPopup, setInfoPopup] = useState<{
     title: string;
     content: string;
@@ -1230,8 +1310,13 @@ export const App: React.FC<AppProps> = ({
         setCurrentTokens("");
         setAgentStatus("idle");
         setMessages([]);
-        setConvHistory([]);
         addMsg({ type: "done", content: `[Compacted]\n${compacted}` });
+        setConvHistory([
+          {
+            role: "assistant",
+            content: `[Conversation summary]\n${compacted || "No summary generated."}`,
+          },
+        ]);
         return;
       }
 
@@ -1280,6 +1365,7 @@ export const App: React.FC<AppProps> = ({
             return;
           }
           setMessages(loaded);
+          setConvHistory(buildContextFromMessages(loaded));
           addMsg({
             type: "done",
             content: `Session "${name}" loaded  (${loaded.length} messages)`,
@@ -1882,14 +1968,18 @@ export const App: React.FC<AppProps> = ({
                     ? Date.now() - agentStartTimeRef.current
                     : undefined,
                 });
-                setConvHistory((prev) =>
-                  [
-                    ...prev,
-                    { role: "user" as const, content: cleanInput },
-                    ...toolMsgsRef.current,
-                    { role: "assistant" as const, content: response },
-                  ].slice(-60),
-                );
+                const nextHistory = [
+                  ...s.current.convHistory,
+                  { role: "user" as const, content: cleanInput },
+                  ...toolMsgsRef.current,
+                  { role: "assistant" as const, content: response },
+                ];
+                setConvHistory(nextHistory.slice(-MAX_CONTEXT_MESSAGES));
+                if (nextHistory.length > MAX_CONTEXT_MESSAGES) {
+                  void compactConversationContext(nextHistory, cm.get().llm).then(
+                    (compactedHistory) => setConvHistory(compactedHistory),
+                  );
+                }
               }
               // Run next queued task if any (only when not aborted)
               if (!aborted && taskQueueRef.current.length > 0) {
